@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.clab</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/steve/clab/bin/clab</string>
+    <string>serve</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>7777</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/steve/clab/bin:/Users/steve/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/steve</string>
+    <key>CLAB_HOST</key>
+    <string>127.0.0.1</string>
+    <key>CLAB_PORT</key>
+    <string>7777</string>
+    <key>CLAB_HOME</key>
+    <string>/Users/steve/.clab</string>
+    <key>CLAB_SKILLS_DIR</key>
+    <string>/Users/steve/.clab/skills</string>
+    <key>CLAB_CODEBASE_BINARY</key>
+    <string>/Users/steve/clab/bin/clab</string>
+    <key>CLAB_CODEBASE_PROJECT_PATH</key>
+    <string>/Users/steve/clab</string>
+    <key>CLAB_MCP_ENABLED</key>
+    <string>true</string>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/steve/clab</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/steve/.clab/logs/clab.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/steve/.clab/logs/clab.err.log</string>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+</dict>
+</plist>
