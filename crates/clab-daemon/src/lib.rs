@@ -19,25 +19,10 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-const TOOLS: &[&str] = &[
-    "index_repository",
-    "search_graph",
-    "query_graph",
-    "trace_path",
-    "get_code_snippet",
-    "get_graph_schema",
-    "get_architecture",
-    "search_code",
-    "list_projects",
-    "delete_project",
-    "index_status",
-    "detect_changes",
-    "skill_search",
-    "skill_get",
-    "skill_list",
-    "skill_upsert",
-    "skill_delete",
-];
+mod mcp;
+mod skills;
+
+use mcp::{dispatch_or_error, mcp};
 
 static PLAN_ID_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -125,8 +110,11 @@ impl AutoIndexDaemon {
                 self.queued.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_secs(self.config.debounce_seconds)).await;
                 if let Some(root) = project.get("root_path").and_then(Value::as_str) {
-                    let _ = store
-                        .index_repository(json!({"repo_path": root, "mode": self.config.mode}))?;
+                    if FsPath::new(root).exists() {
+                        store.index_repository(
+                            json!({"repo_path": root, "mode": self.config.mode}),
+                        )?;
+                    }
                 }
                 self.queued.fetch_sub(1, Ordering::Relaxed);
             }
@@ -178,8 +166,9 @@ fn spawn_worker(daemon: Arc<AutoIndexDaemon>, store: ClabStore) {
             return;
         }
         loop {
-            if let Err(err) = daemon.refresh_once(&store).await {
-                *daemon.last_error.lock().await = Some(err.to_string());
+            match daemon.refresh_once(&store).await {
+                Ok(()) => *daemon.last_error.lock().await = None,
+                Err(err) => *daemon.last_error.lock().await = Some(err.to_string()),
             }
             tokio::time::sleep(Duration::from_secs(daemon.config.poll_interval_seconds)).await;
         }
@@ -257,60 +246,6 @@ async fn profile_expand(Json(body): Json<Value>) -> Json<Value> {
         "budget_used": {"primary_points": 0, "primary_files": 0, "primary_lines": 0},
         "truncated": false
     }))
-}
-
-async fn mcp(State(state): State<AppState>, Json(body): Json<Value>) -> Json<Value> {
-    let id = body.get("id").cloned().unwrap_or(Value::Null);
-    let method = body
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let result = match method {
-        "initialize" => {
-            json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"clab","version":"0.1.0"}})
-        }
-        "ping" => json!({}),
-        "tools/list" => {
-            json!({"tools": TOOLS.iter().map(|name| json!({"name": name, "description": format!("Clab tool {name}"), "inputSchema": {"type":"object"}})).collect::<Vec<_>>() })
-        }
-        "tools/call" => {
-            let params = body.get("params").cloned().unwrap_or_else(|| json!({}));
-            let name = params
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let args = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            match dispatch_mcp_tool(&state.store, name, args) {
-                Ok(value) => json!({"content":[{"type":"text","text": value.to_string()}]}),
-                Err(err) => {
-                    json!({"content":[{"type":"text","text": json!({"error": err.to_string()}).to_string()}],"isError":true})
-                }
-            }
-        }
-        _ => json!({}),
-    };
-    Json(json!({"jsonrpc":"2.0","id":id,"result":result}))
-}
-
-fn dispatch_mcp_tool(store: &ClabStore, name: &str, args: Value) -> Result<Value> {
-    match name {
-        "skill_search" => skill_search(args),
-        "skill_get" => skill_get(args),
-        "skill_list" => skill_list(),
-        "skill_upsert" => skill_upsert(args),
-        "skill_delete" => skill_delete(args),
-        _ => store.dispatch(name, args),
-    }
-}
-
-fn dispatch_or_error(store: &ClabStore, tool: &str, args: Value) -> Value {
-    match dispatch_mcp_tool(store, tool, args) {
-        Ok(value) => value,
-        Err(err) => json!({"error": err.to_string()}),
-    }
 }
 
 fn tracked_projects(store: &ClabStore) -> usize {
@@ -1222,119 +1157,20 @@ fn unique_plan_id() -> String {
     format!("cp_{nanos:x}_{:x}_{seq:x}", process::id())
 }
 
-fn skills_dir() -> PathBuf {
-    env::var_os("CLAB_SKILLS_DIR")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".clab/skills")))
-        .unwrap_or_else(|| PathBuf::from(".clab/skills"))
-}
-
-fn skill_path(name: &str) -> PathBuf {
-    skills_dir().join(format!("{name}.md"))
-}
-
-fn skill_search(args: Value) -> Result<Value> {
-    let query = args
-        .get("query")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_lowercase();
-    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-    let mut results = Vec::new();
-    for skill in read_skills()? {
-        let haystack =
-            format!("{} {} {}", skill["name"], skill["summary"], skill["body"]).to_lowercase();
-        if query.is_empty() || haystack.contains(&query) {
-            results.push(json!({
-                "name": skill["name"],
-                "summary": skill["summary"],
-                "tags": skill["tags"],
-                "version": skill["version"],
-                "score": if query.is_empty() { 1 } else { 3 }
-            }));
-            if results.len() >= limit {
-                break;
-            }
-        }
-    }
-    Ok(Value::Array(results))
-}
-
-fn skill_get(args: Value) -> Result<Value> {
-    let name = args.get("name").and_then(Value::as_str).unwrap_or_default();
-    for skill in read_skills()? {
-        if skill.get("name").and_then(Value::as_str) == Some(name) {
-            return Ok(skill);
-        }
-    }
-    Ok(json!({"error": format!("Skill not found: {name}")}))
-}
-
-fn skill_list() -> Result<Value> {
-    Ok(Value::Array(read_skills()?))
-}
-
-fn skill_upsert(args: Value) -> Result<Value> {
-    let name = args.get("name").and_then(Value::as_str).unwrap_or_default();
-    let summary = args
-        .get("summary")
-        .or_else(|| args.get("description"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let body = args.get("body").and_then(Value::as_str).unwrap_or_default();
-    fs::create_dir_all(skills_dir())?;
-    fs::write(
-        skill_path(name),
-        format!("---\nsummary: {summary}\nversion: 1\n---\n\n{body}\n"),
-    )?;
-    Ok(json!({"name": name, "version": 1, "created": true}))
-}
-
-fn skill_delete(args: Value) -> Result<Value> {
-    let name = args.get("name").and_then(Value::as_str).unwrap_or_default();
-    let path = skill_path(name);
-    let deleted = path.exists();
-    if deleted {
-        fs::remove_file(path)?;
-    }
-    Ok(json!({"name": name, "deleted": deleted}))
-}
-fn read_skills() -> Result<Vec<Value>> {
-    let mut out = Vec::new();
-    let dir = skills_dir();
-    if !dir.exists() {
-        return Ok(out);
-    }
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("md") {
-            continue;
-        }
-        if let Ok(text) = fs::read_to_string(&path) {
-            let name = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            let summary = text
-                .lines()
-                .find_map(|line| line.strip_prefix("summary:"))
-                .map(str::trim)
-                .unwrap_or("");
-            out.push(
-                json!({"name": name, "summary": summary, "tags": [], "version": 1, "body": text}),
-            );
-        }
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        mcp::tool_input_schema,
+        skills::{compact_skill, skill_search},
+    };
     use std::{
         fs,
+        sync::Mutex,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn unique_test_repo(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -1353,6 +1189,85 @@ mod tests {
         assert!(status.enabled);
         assert!(!status.running);
         assert_eq!(status.tracked_projects, 0);
+    }
+
+    #[test]
+    fn mcp_tool_schemas_expose_required_arguments() {
+        let search_code = tool_input_schema("search_code");
+        assert_eq!(search_code["properties"]["pattern"]["type"], "string");
+        assert!(search_code["properties"]["limit"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Defaults to 8"));
+        assert_eq!(search_code["required"], json!(["pattern"]));
+
+        let index_repository = tool_input_schema("index_repository");
+        assert_eq!(
+            index_repository["properties"]["repo_path"]["type"],
+            "string"
+        );
+        assert_eq!(index_repository["required"], json!([]));
+
+        let index_status = tool_input_schema("index_status");
+        assert_eq!(index_status["properties"]["project"]["type"], "string");
+        assert_eq!(index_status["required"], json!(["project"]));
+
+        let detect_changes = tool_input_schema("detect_changes");
+        assert!(detect_changes["properties"]["limit"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Defaults to 50"));
+
+        let skill_get = tool_input_schema("skill_get");
+        assert_eq!(skill_get["properties"]["summary_only"]["type"], "boolean");
+        assert_eq!(skill_get["properties"]["max_chars"]["type"], "integer");
+        assert_eq!(skill_get["required"], json!(["name"]));
+    }
+
+    #[test]
+    fn compact_skill_can_omit_or_truncate_body() {
+        let skill = json!({
+            "name": "demo",
+            "summary": "Demo skill",
+            "tags": [],
+            "version": 1,
+            "body": "abcdef"
+        });
+        let summary = compact_skill(skill.clone(), true, None);
+        assert!(summary.get("body").is_none());
+        assert_eq!(summary["summary"], "Demo skill");
+
+        let truncated = compact_skill(skill, false, Some(3));
+        assert_eq!(truncated["body"], "abc");
+        assert_eq!(truncated["truncated"], true);
+    }
+
+    #[test]
+    fn skill_search_defaults_to_five_results() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_test_repo("skills-default-limit");
+        fs::create_dir_all(&dir).unwrap();
+        let old_skills_dir = env::var_os("CLAB_SKILLS_DIR");
+        env::set_var("CLAB_SKILLS_DIR", &dir);
+
+        for index in 0..7 {
+            fs::write(
+                dir.join(format!("skill-{index}.md")),
+                format!("---\nsummary: Test skill {index}\nversion: 1\n---\n\nbody\n"),
+            )
+            .unwrap();
+        }
+
+        let results = skill_search(json!({})).unwrap();
+
+        if let Some(old_skills_dir) = old_skills_dir {
+            env::set_var("CLAB_SKILLS_DIR", old_skills_dir);
+        } else {
+            env::remove_var("CLAB_SKILLS_DIR");
+        }
+        fs::remove_dir_all(dir).unwrap();
+
+        assert_eq!(results.as_array().unwrap().len(), 5);
     }
 
     #[test]
